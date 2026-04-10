@@ -1,0 +1,4 @@
+bundle:
+  added:
+    code-mode-dev: file:///Users/ken/workspace/ms/code-mode/.amplifier/bundle.md
+  active: code-mode-dev

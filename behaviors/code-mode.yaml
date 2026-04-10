@@ -1,0 +1,19 @@
+bundle:
+  name: code-mode-behavior
+  version: 1.0.0
+  description: >-
+    Code Mode behavior — adds execute_python to any bundle so the LLM can write
+    Python code to orchestrate multi-tool workflows. No orchestrator change required.
+    Compose onto any bundle by adding it to includes:.
+
+# Adds the execute_python tool on top of whatever tools the parent bundle already has.
+# Works with any orchestrator (loop-basic, loop-streaming, or custom).
+tools:
+  - module: tool-execute-python
+    source: ./modules/tool-execute-python
+    config:
+      timeout: 60
+
+context:
+  include:
+    - code-mode:context/instructions.md
