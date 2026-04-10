@@ -18,6 +18,7 @@ flow expresses any pipeline shape — no separate job queue needed:
 | Process a list of items | `for` loop or list comprehension |
 | Recover from failure | `try / except` |
 | Parse and transform data | `json`, `yaml`, `re`, `pathlib`, etc. |
+| Parallel but max N at a time | `asyncio.Semaphore(N)` |
 
 **The full Python standard library is available.** Import anything at the top of
 your block: `json`, `yaml`, `os`, `re`, `pathlib`, `collections`, `itertools`,
@@ -206,11 +207,91 @@ if match:
         print("tool-new-capability already present")
 ```
 
+### 8. Controlled concurrency — limit how many run at once
+
+Plain `asyncio.gather()` over a large list launches **everything simultaneously**.
+That can exceed API rate limits, overwhelm file descriptors, or produce
+thundering-herd pressure. Use `asyncio.Semaphore` to cap concurrent operations
+while still processing the whole list in one block.
+
+**Semaphore (recommended)** — always keeps exactly N running; as one finishes the
+next starts immediately:
+
+```python
+import asyncio
+
+async def run_limited(items, tool_fn, limit=10):
+    sem = asyncio.Semaphore(limit)
+
+    async def one(item):
+        async with sem:
+            return await tool_fn(item)
+
+    return await asyncio.gather(*[one(item) for item in items])
+
+# Example: read 500 files, but only 20 at a time
+ls = await bash("find src/ -name '*.py' -not -path '*/__pycache__/*'")
+py_files = [f.strip() for f in ls['stdout'].splitlines() if f.strip()]
+
+results = await run_limited(
+    py_files,
+    lambda f: read_file(f),
+    limit=20,
+)
+print(f"Read {len(results)} files")
+```
+
+Or inline, without a helper function:
+
+```python
+import asyncio
+
+sem = asyncio.Semaphore(5)  # max 5 GitHub API calls at once
+
+async def fetch_pr(number):
+    async with sem:
+        return await bash(f"gh pr view {number} --json title,reviews,files")
+
+pr_numbers = list(range(1, 51))  # PRs 1–50
+results = await asyncio.gather(*[fetch_pr(n) for n in pr_numbers])
+print(f"Fetched {len(results)} PRs with max 5 concurrent")
+```
+
+**Batching (simpler, less efficient)** — waits for the slowest item in each
+batch before starting the next. Fine for small lists or when ordering matters:
+
+```python
+import asyncio
+
+items = list(range(100))
+batch_size = 10
+results = []
+
+for i in range(0, len(items), batch_size):
+    batch = items[i : i + batch_size]
+    batch_results = await asyncio.gather(*[
+        bash(f"process {item}") for item in batch
+    ])
+    results.extend(batch_results)
+    print(f"Batch {i//batch_size + 1} done")
+
+print(f"Processed {len(results)} items")
+```
+
+**Semaphore vs batching:**
+
+| | Semaphore | Batching |
+|---|---|---|
+| Throughput | Higher — next item starts as soon as a slot frees | Lower — waits for slowest in batch |
+| Simplicity | Requires a small helper | Straightforward loop |
+| Use when | Rate limits, large lists, maximum speed | Ordered processing, simple scripts |
+
 ## Parallel execution with asyncio.gather()
 
 Use `asyncio.gather()` **only when calls are truly independent** — no result from
 one is needed by another before the gather completes. If B needs A's output,
-just `await` them sequentially.
+just `await` them sequentially. For large lists, use a **Semaphore** (pattern 8)
+to limit concurrency.
 
 ```python
 import asyncio
