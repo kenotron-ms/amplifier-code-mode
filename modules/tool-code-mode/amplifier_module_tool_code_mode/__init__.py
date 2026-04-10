@@ -19,6 +19,7 @@ import contextlib
 import io
 import logging
 import textwrap
+import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -88,10 +89,8 @@ def _generate_tool_interfaces(tools: dict[str, Any]) -> str:
         raw_desc: str = getattr(tool, "description", "") or ""
 
         # First sentence only — avoid embedding recursive interface blocks
-        tool_desc = (
-            (raw_desc.split("\n")[0].split(". ")[0].strip() + ".") if raw_desc else ""
-        )
-        tool_desc = tool_desc.rstrip("..").rstrip(".")  # clean up doubled periods
+        tool_desc = (raw_desc.split("\n")[0].split(". ")[0].strip() + ".") if raw_desc else ""
+        tool_desc = tool_desc.rstrip(".").rstrip(".")  # clean up doubled periods
         if tool_desc and not tool_desc.endswith("."):
             tool_desc += "."
 
@@ -136,11 +135,20 @@ def _generate_tool_interfaces(tools: dict[str, Any]) -> str:
             if annotation_parts:
                 doc_lines.append(f"    {pname}: {' — '.join(annotation_parts)}")
 
-        # ---- assemble stub ----
-        if param_lines:
-            sig = "(\n" + "\n".join(param_lines) + "\n) -> str"
+        # ---- return shape (from output_schema if present, else generic) ----
+        output_schema = getattr(tool, "output_schema", None)
+        if output_schema and isinstance(output_schema, dict):
+            out_props = output_schema.get("properties", {})
+            if out_props:
+                keys_str = ", ".join(f"'{k}'" for k in out_props)
+                doc_lines.append(f"    Returns: dict — keys: {keys_str}")
+            else:
+                doc_lines.append("    Returns: dict")
         else:
-            sig = "() -> str"
+            doc_lines.append("    Returns: dict — use result['key'] to access values")
+
+        # ---- assemble stub ----
+        sig = "(\n" + "\n".join(param_lines) + "\n) -> dict" if param_lines else "() -> dict"
 
         if doc_lines:
             inner = "\n".join(doc_lines)
@@ -168,16 +176,30 @@ def _make_wrapper(tool_name: str, tool_obj: Any, hooks: Any) -> Any:
     schema: dict[str, Any] = getattr(tool_obj, "input_schema", {}) or {}
     param_names = list((schema.get("properties") or {}).keys())
 
-    async def wrapper(*args: Any, **kwargs: Any) -> str:
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
         for i, val in enumerate(args):
             if i < len(param_names):
                 kwargs.setdefault(param_names[i], val)
-        await hooks.emit("tool:pre", {"tool_name": tool_name, "tool_input": kwargs})
-        result = await tool_obj.execute(kwargs)
-        output = getattr(result, "output", None) or str(result)
+        call_id = str(uuid.uuid4())
+        # Use prefixed event names so the orchestrator's trace_collector_post
+        # (which tracks LLM-dispatched tool calls only) does not try to correlate
+        # these inner calls against its in-flight registry and crash.
+        # As a bonus, this prevents logging-hook stdout output from leaking into
+        # the captured exec() buffer.
         await hooks.emit(
-            "tool:post",
+            "code_mode:tool:pre",
+            {"call_id": call_id, "tool_name": tool_name, "tool_input": kwargs},
+        )
+        result = await tool_obj.execute(kwargs)
+        # Explicit None check — avoids silently replacing falsy-but-valid outputs
+        # (empty dict, empty string, False, 0) with str(result).
+        output = getattr(result, "output", None)
+        if output is None:
+            output = str(result)
+        await hooks.emit(
+            "code_mode:tool:post",
             {
+                "call_id": call_id,
                 "tool_name": tool_name,
                 "tool_input": kwargs,
                 "tool_result": output,
@@ -208,7 +230,8 @@ async def _execute_code(
     stdout is captured with redirect_stdout.
     """
     namespace: dict[str, Any] = {
-        name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()
+        "asyncio": asyncio,  # pre-injected: asyncio.gather(), asyncio.sleep(), etc.
+        **{name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()},
     }
 
     # Wrap in async def so user code can use await anywhere at the top level
@@ -282,11 +305,16 @@ class CodeModeTool:
         run_tools = {k: v for k, v in all_tools.items() if k != self.name}
         interfaces = _generate_tool_interfaces(run_tools)
         return (
-            "Execute Python async code in-process. "
-            "Combine multiple tool calls with Python logic (loops, conditions, "
-            "data processing) and return one aggregated result via print().\n\n"
+            "PREFER THIS over individual tool calls whenever you need 2 or more operations.\n"
+            "One tool_code_mode call with asyncio.gather() replaces N sequential LLM round-trips,\n"
+            "runs tools in parallel, and keeps intermediate data out of context.\n\n"
+            "Execute Python async code in-process. All session tools are available as awaitable\n"
+            "async functions — use await to call them. Use print() to return results.\n"
+            "Tool functions return dicts — access values with result['key'].\n"
+            "If you're unsure of a tool's keys, use print(list(result.keys())).\n\n"
             f"Available functions (already in scope — use await):\n{interfaces}\n\n"
-            "Standard library (json, os, re, pathlib, etc.) is also available."
+            "Standard library (json, os, re, pathlib, etc.) is also available.\n"
+            "asyncio is pre-injected — use asyncio.gather() directly without import."
         )
 
     async def execute(self, input_data: dict[str, Any]) -> Any:

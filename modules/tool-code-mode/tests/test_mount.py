@@ -7,19 +7,26 @@ Tests:
   - CodeModeTool has name, description, input_schema
   - _generate_tool_interfaces produces correct stubs (Literal types, docstrings)
   - _execute_code runs real Python in-process (no amplifier_core needed)
+  - _make_wrapper emits tool_call_id in both tool:pre and tool:post events
+  - _make_wrapper does not replace falsy-but-valid outputs with str(result)
+  - asyncio is pre-injected into the execution namespace
+  - execute() wraps output in ToolResult (integration test with mocked amplifier_core)
 """
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from amplifier_module_tool_code_mode import (
     CodeModeTool,
-    _NoOpHooks,
     _execute_code,
     _generate_tool_interfaces,
+    _NoOpHooks,
     _schema_to_type,
     mount,
 )
@@ -202,8 +209,8 @@ def test_generate_tool_interfaces_optional_param_has_default():
         "required": ["file_path"],
     }
     result = _generate_tool_interfaces({"read_file": tool})
-    assert "file_path: str," in result        # required — no default
-    assert "offset: int = None," in result    # optional — has default
+    assert "file_path: str," in result  # required — no default
+    assert "offset: int = None," in result  # optional — has default
 
 
 def test_generate_tool_interfaces_enum_becomes_literal():
@@ -346,3 +353,215 @@ async def test_execute_code_calls_tool_in_process():
     )
     assert result == "got:hello"
     assert result_holder == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# asyncio pre-injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_asyncio_is_pre_injected():
+    """asyncio must be available without an explicit import statement."""
+    result = await _execute_code(
+        code=(
+            "results = await asyncio.gather("
+            "*[asyncio.sleep(0) for _ in range(3)]"
+            ")\n"
+            "print('gathered')"
+        ),
+        tools={},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    assert result == "gathered"
+
+
+@pytest.mark.asyncio
+async def test_asyncio_gather_runs_multiple_tools_in_parallel():
+    """asyncio.gather() must work across multiple injected tool wrappers simultaneously."""
+    call_log: list[str] = []
+
+    async def _make_execute(label: str):
+        async def _execute(input_data: dict) -> MagicMock:  # noqa: ARG001
+            call_log.append(label)
+            m = MagicMock()
+            m.output = label
+            return m
+
+        return _execute
+
+    tool_a, tool_b = MagicMock(), MagicMock()
+    for mock, label in [(tool_a, "a"), (tool_b, "b")]:
+        mock.input_schema = {"type": "object", "properties": {}, "required": []}
+        mock.execute = await _make_execute(label)
+
+    result = await _execute_code(
+        code="a, b = await asyncio.gather(tool_a(), tool_b())\nprint(a, b)",
+        tools={"tool_a": tool_a, "tool_b": tool_b},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    assert "a" in result and "b" in result
+    assert set(call_log) == {"a", "b"}
+
+
+# ---------------------------------------------------------------------------
+# _make_wrapper — tool_call_id in hook events
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_make_wrapper_emits_tool_call_id_in_pre_and_post():
+    """Both tool:pre and tool:post events must carry a matching, non-empty tool_call_id."""
+    fake_tool = MagicMock()
+    fake_tool.input_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "required": ["x"],
+    }
+    result_mock = MagicMock()
+    result_mock.output = "ok"
+    fake_tool.execute = AsyncMock(return_value=result_mock)
+
+    emitted: list[tuple] = []
+
+    class CapturingHooks:
+        async def emit(self, event: str, data: Any = None) -> None:
+            emitted.append((event, data or {}))
+
+    await _execute_code(
+        code='await fake_tool(x="hi")',
+        tools={"fake_tool": fake_tool},
+        hooks=CapturingHooks(),
+        timeout=10,
+    )
+
+    pre_events = [(e, d) for e, d in emitted if e == "code_mode:tool:pre"]
+    post_events = [(e, d) for e, d in emitted if e == "code_mode:tool:post"]
+
+    assert len(pre_events) == 1, "expected exactly one tool:pre event"
+    assert len(post_events) == 1, "expected exactly one tool:post event"
+
+    pre_id = pre_events[0][1].get("call_id", "")
+    post_id = post_events[0][1].get("call_id", "")
+
+    assert pre_id, "call_id must be non-empty in tool:pre"
+    assert post_id, "call_id must be non-empty in tool:post"
+    assert pre_id == post_id, "call_id must be the same in pre and post"
+
+
+# ---------------------------------------------------------------------------
+# _make_wrapper — truthiness fix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_make_wrapper_returns_empty_dict_not_str_result():
+    """Falsy-but-valid output ({}) must be returned as-is, not replaced by str(result)."""
+    fake_tool = MagicMock()
+    fake_tool.input_schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+        "required": ["x"],
+    }
+    result_mock = MagicMock()
+    result_mock.output = {}  # falsy but valid
+    fake_tool.execute = AsyncMock(return_value=result_mock)
+
+    result = await _execute_code(
+        code='out = await fake_tool(x="hi")\nprint(type(out).__name__)',
+        tools={"fake_tool": fake_tool},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    # With the fix: out == {} so type is "dict"
+    # With the old bug: out == str(result_mock) so type would be "str"
+    assert result == "dict", f"expected 'dict' but got: {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_make_wrapper_returns_empty_string_not_str_result():
+    """Falsy empty-string output must be returned as-is, not replaced by str(result)."""
+    fake_tool = MagicMock()
+    fake_tool.input_schema = {"type": "object", "properties": {}, "required": []}
+    result_mock = MagicMock()
+    result_mock.output = ""  # falsy but valid
+    fake_tool.execute = AsyncMock(return_value=result_mock)
+
+    result = await _execute_code(
+        code="out = await fake_tool()\nprint(repr(out))",
+        tools={"fake_tool": fake_tool},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    assert result == "''", f"expected empty string repr but got: {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# execute() integration — ToolResult boundary (mocked amplifier_core)
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_amplifier_core() -> list:
+    """Install a fake amplifier_core.ToolResult; return the capture list."""
+    captured: list[dict] = []
+
+    class FakeToolResult:
+        def __init__(self, success: bool, output: Any) -> None:
+            self.success = success
+            self.output = output
+            captured.append({"success": success, "output": output})
+
+    fake_module = ModuleType("amplifier_core")
+    fake_module.ToolResult = FakeToolResult  # type: ignore[attr-defined]
+    sys.modules["amplifier_core"] = fake_module
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_execute_wraps_stdout_in_tool_result():
+    """execute() must call ToolResult(success=True, output=<captured stdout>)."""
+    captured = _install_fake_amplifier_core()
+    try:
+        coord = _fake_coordinator()
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"code": 'print("hello from execute")'})
+
+        assert len(captured) == 1
+        assert captured[0]["success"] is True
+        assert captured[0]["output"] == "hello from execute"
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_empty_code_returns_error_tool_result():
+    """execute() must return ToolResult(success=False) for empty/missing code."""
+    captured = _install_fake_amplifier_core()
+    try:
+        coord = _fake_coordinator()
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"code": ""})
+
+        assert len(captured) == 1
+        assert captured[0]["success"] is False
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_runtime_error_is_in_output_not_exception():
+    """When code raises, execute() returns ToolResult(success=True, output='Error: ...')."""
+    captured = _install_fake_amplifier_core()
+    try:
+        coord = _fake_coordinator()
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"code": "raise RuntimeError('boom')"})
+
+        assert len(captured) == 1
+        # execute() succeeds; the error is surfaced in the output string
+        assert captured[0]["success"] is True
+        assert "RuntimeError" in captured[0]["output"] or "boom" in captured[0]["output"]
+    finally:
+        sys.modules.pop("amplifier_core", None)
