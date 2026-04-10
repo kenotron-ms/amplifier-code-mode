@@ -216,6 +216,22 @@ def _make_wrapper(tool_name: str, tool_obj: Any, hooks: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+async def _gather_limited(coros: Any, limit: int = 10) -> list[Any]:
+    """
+    Like asyncio.gather() but caps concurrent execution to `limit` at a time.
+
+    Usage (pre-injected as gather_limited — no import needed):
+        results = await gather_limited([tool(x) for x in items], limit=20)
+    """
+    sem = asyncio.Semaphore(limit)
+
+    async def _one(coro: Any) -> Any:
+        async with sem:
+            return await coro
+
+    return list(await asyncio.gather(*[_one(c) for c in coros]))
+
+
 async def _execute_code(
     code: str,
     tools: dict[str, Any],
@@ -231,6 +247,7 @@ async def _execute_code(
     """
     namespace: dict[str, Any] = {
         "asyncio": asyncio,  # pre-injected: asyncio.gather(), asyncio.sleep(), etc.
+        "gather_limited": _gather_limited,  # pre-injected: cap concurrency, e.g. await gather_limited([...], limit=10)
         **{name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()},
     }
 
@@ -325,7 +342,9 @@ class CodeModeTool:
             "If you're unsure of a tool's keys, use print(list(result.keys())).\n\n"
             f"Available functions (already in scope — use await):\n{interfaces}\n\n"
             "Standard library (json, os, re, pathlib, etc.) is also available.\n"
-            "asyncio is pre-injected — use asyncio.gather() directly without import."
+            "asyncio is pre-injected — use asyncio.gather() directly without import.\n"
+            "gather_limited(coros, limit=10) is also pre-injected — cap concurrent tool calls:\n"
+            "  results = await gather_limited([tool(x) for x in items], limit=20)"
         )
 
     async def execute(self, input_data: dict[str, Any]) -> Any:
