@@ -283,8 +283,19 @@ class CodeModeTool:
                     "Use await when calling them. Use print() for output."
                 ),
             },
+            "tool_name": {
+                "type": "string",
+                "description": (
+                    "For a SINGLE tool call — name of the tool to invoke directly "
+                    "(faster: no Python exec overhead). Use with tool_args."
+                ),
+            },
+            "tool_args": {
+                "type": "object",
+                "description": "Arguments for the single tool call (used with tool_name).",
+            },
         },
-        "required": ["code"],
+        # No required — either code OR tool_name+tool_args
     }
 
     def __init__(self, coordinator: Any, config: dict[str, Any]) -> None:
@@ -305,11 +316,11 @@ class CodeModeTool:
         run_tools = {k: v for k, v in all_tools.items() if k != self.name}
         interfaces = _generate_tool_interfaces(run_tools)
         return (
-            "PREFER THIS over individual tool calls whenever you need 2 or more operations.\n"
-            "One tool_code_mode call with asyncio.gather() replaces N sequential LLM round-trips,\n"
-            "runs tools in parallel, and keeps intermediate data out of context.\n\n"
-            "Execute Python async code in-process. All session tools are available as awaitable\n"
-            "async functions — use await to call them. Use print() to return results.\n"
+            "Two calling conventions — pick the right one:\n\n"
+            "  SINGLE operation:  tool_name='bash', tool_args={'command': 'ls'}  (direct call, no exec overhead)\n"
+            "  2+ operations:     code='...' with asyncio.gather()               (parallel, keeps data out of context)\n\n"
+            "For the code path: all session tools are available as awaitable async functions —\n"
+            "use await to call them. Use print() to return results.\n"
             "Tool functions return dicts — access values with result['key'].\n"
             "If you're unsure of a tool's keys, use print(list(result.keys())).\n\n"
             f"Available functions (already in scope — use await):\n{interfaces}\n\n"
@@ -320,10 +331,6 @@ class CodeModeTool:
     async def execute(self, input_data: dict[str, Any]) -> Any:
         from amplifier_core import ToolResult  # type: ignore[import]  # peer dep
 
-        code: str = (input_data.get("code") or "").strip()
-        if not code:
-            return ToolResult(success=False, output="Error: no code provided")
-
         all_tools: dict[str, Any] = self._coordinator.get("tools") or {}
         run_tools = {k: v for k, v in all_tools.items() if k != self.name}
 
@@ -333,6 +340,41 @@ class CodeModeTool:
             candidate = self._coordinator.get("hooks")
             if candidate is not None and hasattr(candidate, "emit"):
                 hooks = candidate
+
+        # Fast path: single tool call, no exec overhead
+        tool_name: str = (input_data.get("tool_name") or "").strip()
+        if tool_name:
+            tool = run_tools.get(tool_name)
+            if tool is None:
+                return ToolResult(success=False, output=f"Error: unknown tool '{tool_name}'")
+            tool_args: dict[str, Any] = input_data.get("tool_args") or {}
+            call_id = str(uuid.uuid4())
+            await hooks.emit(
+                "code_mode:tool:pre",
+                {"call_id": call_id, "tool_name": tool_name, "tool_input": tool_args},
+            )
+            result = await tool.execute(tool_args)
+            output = getattr(result, "output", None)
+            if output is None:
+                output = str(result)
+            await hooks.emit(
+                "code_mode:tool:post",
+                {
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "tool_input": tool_args,
+                    "tool_result": output,
+                },
+            )
+            return ToolResult(success=True, output=output)
+
+        # Python path: multi-step code execution
+        code: str = (input_data.get("code") or "").strip()
+        if not code:
+            return ToolResult(
+                success=False,
+                output="Error: provide 'code' for multi-step execution or 'tool_name'+'tool_args' for a single call",
+            )
 
         result = await _execute_code(
             code=code,

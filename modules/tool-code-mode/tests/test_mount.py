@@ -129,7 +129,15 @@ def test_tool_input_schema_has_code():
     coord = _fake_coordinator()
     tool = CodeModeTool(coordinator=coord, config={})
     assert "code" in tool.input_schema["properties"]
-    assert "code" in tool.input_schema.get("required", [])
+    # code is no longer required — either code OR tool_name+tool_args
+    assert "required" not in tool.input_schema
+
+
+def test_tool_input_schema_has_tool_name_and_tool_args():
+    coord = _fake_coordinator()
+    tool = CodeModeTool(coordinator=coord, config={})
+    assert "tool_name" in tool.input_schema["properties"]
+    assert "tool_args" in tool.input_schema["properties"]
 
 
 def test_tool_timeout_default():
@@ -563,5 +571,144 @@ async def test_execute_runtime_error_is_in_output_not_exception():
         # execute() succeeds; the error is surfaced in the output string
         assert captured[0]["success"] is True
         assert "RuntimeError" in captured[0]["output"] or "boom" in captured[0]["output"]
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_neither_code_nor_tool_name_returns_error():
+    """execute() with no code and no tool_name must return ToolResult(success=False)."""
+    captured = _install_fake_amplifier_core()
+    try:
+        coord = _fake_coordinator()
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({})
+
+        assert len(captured) == 1
+        assert captured[0]["success"] is False
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+# ---------------------------------------------------------------------------
+# execute() fast path — tool_name + tool_args
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_calls_tool_directly():
+    """tool_name+tool_args must call the target tool without going through exec()."""
+    captured = _install_fake_amplifier_core()
+    try:
+        fake_bash = MagicMock()
+        fake_bash.input_schema = {"type": "object", "properties": {}, "required": []}
+        result_mock = MagicMock()
+        result_mock.output = "drwxr-xr-x  foo"
+        fake_bash.execute = AsyncMock(return_value=result_mock)
+
+        coord = _fake_coordinator(tools={"bash": fake_bash})
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"tool_name": "bash", "tool_args": {"command": "ls"}})
+
+        fake_bash.execute.assert_called_once_with({"command": "ls"})
+        assert captured[0]["success"] is True
+        assert captured[0]["output"] == "drwxr-xr-x  foo"
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_unknown_tool_returns_error():
+    """tool_name that doesn't exist must return ToolResult(success=False)."""
+    captured = _install_fake_amplifier_core()
+    try:
+        coord = _fake_coordinator(tools={})
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"tool_name": "nonexistent"})
+
+        assert len(captured) == 1
+        assert captured[0]["success"] is False
+        assert "nonexistent" in captured[0]["output"]
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_emits_hook_events_with_matching_call_id():
+    """Fast path must emit code_mode:tool:pre and code_mode:tool:post with matching call_id."""
+    captured = _install_fake_amplifier_core()
+    try:
+        fake_bash = MagicMock()
+        fake_bash.input_schema = {"type": "object", "properties": {}, "required": []}
+        result_mock = MagicMock()
+        result_mock.output = "ok"
+        fake_bash.execute = AsyncMock(return_value=result_mock)
+
+        emitted: list[tuple] = []
+
+        class CapturingHooks:
+            async def emit(self, event: str, data: Any = None) -> None:
+                emitted.append((event, data or {}))
+
+        coord = _fake_coordinator(tools={"bash": fake_bash})
+        # Inject capturing hooks via coordinator
+        coord.get = MagicMock(
+            side_effect=lambda slot, *_: (
+                {"bash": fake_bash} if slot == "tools" else CapturingHooks()
+            )
+        )
+
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"tool_name": "bash", "tool_args": {"command": "ls"}})
+
+        pre = [(e, d) for e, d in emitted if e == "code_mode:tool:pre"]
+        post = [(e, d) for e, d in emitted if e == "code_mode:tool:post"]
+
+        assert len(pre) == 1
+        assert len(post) == 1
+        assert pre[0][1]["call_id"] == post[0][1]["call_id"]
+        assert pre[0][1]["call_id"] != ""
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_handles_falsy_output():
+    """Fast path must not replace falsy-but-valid output (empty string) with str(result)."""
+    captured = _install_fake_amplifier_core()
+    try:
+        fake_tool = MagicMock()
+        fake_tool.input_schema = {"type": "object", "properties": {}, "required": []}
+        result_mock = MagicMock()
+        result_mock.output = ""  # falsy but valid
+        fake_tool.execute = AsyncMock(return_value=result_mock)
+
+        coord = _fake_coordinator(tools={"mytool": fake_tool})
+        tool = CodeModeTool(coordinator=coord, config={})
+        await tool.execute({"tool_name": "mytool", "tool_args": {}})
+
+        assert captured[0]["success"] is True
+        assert captured[0]["output"] == ""
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_passes_tool_args():
+    """Fast path must forward tool_args exactly as-is to the target tool."""
+    captured = _install_fake_amplifier_core()
+    try:
+        fake_tool = MagicMock()
+        fake_tool.input_schema = {"type": "object", "properties": {}, "required": []}
+        result_mock = MagicMock()
+        result_mock.output = "done"
+        fake_tool.execute = AsyncMock(return_value=result_mock)
+
+        coord = _fake_coordinator(tools={"write_file": fake_tool})
+        tool = CodeModeTool(coordinator=coord, config={})
+        args = {"file_path": "/tmp/x.txt", "content": "hello"}
+        await tool.execute({"tool_name": "write_file", "tool_args": args})
+
+        fake_tool.execute.assert_called_once_with(args)
     finally:
         sys.modules.pop("amplifier_core", None)
