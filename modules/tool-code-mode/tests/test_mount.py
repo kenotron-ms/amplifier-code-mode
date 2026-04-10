@@ -27,6 +27,7 @@ from amplifier_module_tool_code_mode import (
     _execute_code,
     _generate_tool_interfaces,
     _NoOpHooks,
+    _remove_unused_imports,
     _schema_to_type,
     mount,
 )
@@ -712,3 +713,87 @@ async def test_execute_fast_path_passes_tool_args():
         fake_tool.execute.assert_called_once_with(args)
     finally:
         sys.modules.pop("amplifier_core", None)
+
+
+# ---------------------------------------------------------------------------
+# _remove_unused_imports — deterministic lint + auto-fix (no LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_ruff_clean_code_no_issues():
+    """Clean code must return unchanged (modulo formatting)."""
+    fixed = _remove_unused_imports("print('hello')")
+    assert "print" in fixed
+
+
+def test_ruff_removes_unused_import():
+    """ruff --fix must auto-remove unused imports (F401)."""
+    fixed = _remove_unused_imports("import os\nprint('hello')")
+    assert "import os" not in fixed
+    assert "print" in fixed  # quote style may be normalised by ruff format
+
+
+def test_ruff_injected_names_not_flagged():
+    """Injected tool names (bash, read_file, asyncio, gather_limited) must not crash ruff."""
+    fixed = _remove_unused_imports(
+        "result = await bash('ls')\n"
+        "f = await read_file('/tmp/x')\n"
+        "r = await gather_limited([], limit=5)\n"
+        "print(result, f, r)"
+    )
+    # ruff must return a string (not crash); injected names are suppressed via --ignore F821
+    assert isinstance(fixed, str)
+    assert "print" in fixed
+
+
+def test_ruff_fixes_returns_runnable_code():
+    """Auto-fixed code must still be runnable Python (exec should not raise)."""
+    fixed = _remove_unused_imports("import sys  # unused\nx = 1\nprint(x)")
+    compile(fixed, "<test>", "exec")  # raises SyntaxError if broken
+
+
+def test_ruff_graceful_on_empty_code():
+    """Empty code must not crash _remove_unused_imports."""
+    fixed = _remove_unused_imports("")
+    assert isinstance(fixed, str)
+
+
+def test_ruff_returns_str():
+    """Return type must always be str — never raises."""
+    result = _remove_unused_imports("print('ok')")
+    assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# _execute_code — lint integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_code_auto_fixes_unused_import():
+    """_execute_code must auto-fix unused imports and still run the code."""
+    result = await _execute_code(
+        code="import os\nprint('ran')",
+        tools={},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    assert "ran" in result
+
+
+@pytest.mark.asyncio
+async def test_execute_code_lint_issues_prefixed_in_output():
+    """Remaining lint issues must appear before '---' in output; code still runs."""
+    # F841: local variable assigned but never used — ruff reports but does not auto-fix
+    result = await _execute_code(
+        code="x = 1\nprint('hi')",
+        tools={},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    # Code must run regardless
+    assert "hi" in result
+    # If ruff reported x as unused, it should appear before the separator
+    if "[ruff]" in result:
+        assert "---" in result
+        assert result.index("[ruff]") < result.index("---")

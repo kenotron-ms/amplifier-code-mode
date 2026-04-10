@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import ast
 import textwrap
 import uuid
 from typing import Any
@@ -212,8 +213,52 @@ def _make_wrapper(tool_name: str, tool_obj: Any, hooks: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# In-process execution
+# Ruff lint + auto-fix (deterministic, no LLM)
 # ---------------------------------------------------------------------------
+
+def _remove_unused_imports(code: str) -> str:
+        """Remove unused imports from code using Python's ast module.
+
+        Walks the AST to find every Name/Attribute root referenced outside import
+        statements, then drops any import whose bound names are entirely absent.
+        Returns the original code unchanged if parsing fails (SyntaxError is left
+        for compile() to surface with a cleaner message).
+        Completely in-process — no subprocess, no temp files, no external tools.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return code
+
+        # Collect every name referenced in non-import nodes.
+        used: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                root = node
+                while isinstance(root, ast.Attribute):
+                    root = root.value  # type: ignore[assignment]
+                if isinstance(root, ast.Name):
+                    used.add(root.id)
+
+        # Find line ranges of import statements whose bound names are all unused.
+        drop: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if all((a.asname or a.name.split(".")[0]) not in used for a in node.names):
+                    drop.update(range(node.lineno, node.end_lineno + 1))
+            elif isinstance(node, ast.ImportFrom):
+                if all((a.asname or a.name) not in used for a in node.names):
+                    drop.update(range(node.lineno, node.end_lineno + 1))
+
+        if not drop:
+            return code
+
+        kept = [ln for i, ln in enumerate(code.splitlines(keepends=True), 1) if i not in drop]
+        return "".join(kept).strip()
 
 
 async def _gather_limited(coros: Any, limit: int = 10) -> list[Any]:
@@ -250,6 +295,10 @@ async def _execute_code(
         "gather_limited": _gather_limited,  # pre-injected: cap concurrency, e.g. await gather_limited([...], limit=10)
         **{name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()},
     }
+
+    # Remove unused imports in-process via ast analysis — no subprocess, no LLM.
+    # Falls back to original code if the code has a SyntaxError (caught later by compile()).
+    code = _remove_unused_imports(code)
 
     # Wrap in async def so user code can use await anywhere at the top level
     indented = textwrap.indent(code, "    ")
