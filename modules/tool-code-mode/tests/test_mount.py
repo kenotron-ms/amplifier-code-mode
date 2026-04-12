@@ -26,6 +26,8 @@ from amplifier_module_tool_code_mode import (
     CodeModeTool,
     _execute_code,
     _generate_tool_interfaces,
+    _KNOWN_OUTPUT_SCHEMAS,
+    _make_describe_fn,
     _NoOpHooks,
     _remove_unused_imports,
     _schema_to_type,
@@ -797,3 +799,163 @@ async def test_execute_code_lint_issues_prefixed_in_output():
     if "[ruff]" in result:
         assert "---" in result
         assert result.index("[ruff]") < result.index("---")
+
+
+# ---------------------------------------------------------------------------
+# _KNOWN_OUTPUT_SCHEMAS — coverage and correctness
+# ---------------------------------------------------------------------------
+
+
+def test_known_output_schemas_covers_core_tools():
+    """The most frequently used tools must all have known return shapes."""
+    required = {"bash", "read_file", "write_file", "edit_file", "glob", "grep", "web_fetch"}
+    missing = required - set(_KNOWN_OUTPUT_SCHEMAS.keys())
+    assert not missing, f"Missing known schemas for: {missing}"
+
+
+def test_known_output_schemas_bash_keys():
+    assert _KNOWN_OUTPUT_SCHEMAS["bash"] == ["stdout", "stderr", "returncode"]
+
+
+def test_known_output_schemas_read_file_keys():
+    keys = _KNOWN_OUTPUT_SCHEMAS["read_file"]
+    assert "content" in keys
+    assert "file_path" in keys
+    assert "total_lines" in keys
+
+
+def test_known_output_schemas_all_values_are_nonempty_lists():
+    for tool_name, keys in _KNOWN_OUTPUT_SCHEMAS.items():
+        assert isinstance(keys, list), f"{tool_name}: expected list, got {type(keys)}"
+        assert len(keys) > 0, f"{tool_name}: keys list must not be empty"
+        assert all(isinstance(k, str) for k in keys), f"{tool_name}: all keys must be strings"
+
+
+# ---------------------------------------------------------------------------
+# _generate_tool_interfaces — stubs show known return keys
+# ---------------------------------------------------------------------------
+
+
+def test_stubs_show_known_return_keys_for_bash():
+    """Stub for a tool named 'bash' must show known return keys, not the generic fallback."""
+    tool = _fake_tool("bash", "Run a shell command.")
+    result = _generate_tool_interfaces({"bash": tool})
+    # Must contain specific keys, not the generic fallback
+    assert "Returns: dict" in result
+    assert "'stdout'" in result
+    assert "'stderr'" in result
+    assert "'returncode'" in result
+    assert "use result['key'] to access values" not in result
+
+
+def test_stubs_show_known_return_keys_for_glob():
+    """Stub for 'glob' must show its known keys."""
+    tool = MagicMock()
+    tool.name = "glob"
+    tool.description = "Glob files."
+    tool.input_schema = {"type": "object", "properties": {}, "required": []}
+    result = _generate_tool_interfaces({"glob": tool})
+    assert "'files'" in result
+    assert "'total_files'" in result
+
+
+def test_stubs_use_generic_fallback_for_unknown_tools():
+    """Tool not in _KNOWN_OUTPUT_SCHEMAS and without output_schema gets generic fallback."""
+    tool = MagicMock()
+    tool.name = "mystery_tool"
+    tool.description = "Does something."
+    tool.input_schema = {"type": "object", "properties": {}, "required": []}
+    # No output_schema attribute
+    del tool.output_schema
+    result = _generate_tool_interfaces({"mystery_tool": tool})
+    assert "use result['key'] to access values" in result
+
+
+def test_stubs_prefer_output_schema_over_known():
+    """When output_schema is present on the tool, it takes priority over _KNOWN_OUTPUT_SCHEMAS."""
+    tool = _fake_tool("bash", "Run a shell command.")
+    tool.output_schema = {"properties": {"custom_key": {"type": "string"}}}
+    result = _generate_tool_interfaces({"bash": tool})
+    assert "'custom_key'" in result
+    assert "'stdout'" not in result  # known schema must be bypassed
+
+
+# ---------------------------------------------------------------------------
+# _make_describe_fn / describe() — runtime introspection
+# ---------------------------------------------------------------------------
+
+
+def test_describe_returns_known_keys_for_bash():
+    tools = {"bash": _fake_tool("bash")}
+    describe = _make_describe_fn(tools)
+    result = describe("bash")
+    assert result["keys"] == ["stdout", "stderr", "returncode"]
+    assert result["source"] == "known"
+
+
+def test_describe_returns_error_for_unknown_tool():
+    tools = {"bash": _fake_tool("bash")}
+    describe = _make_describe_fn(tools)
+    result = describe("nonexistent")
+    assert "error" in result
+    assert "nonexistent" in result["error"]
+    assert "bash" in result["available"]
+
+
+def test_describe_prefers_output_schema_over_known():
+    """output_schema on the tool object takes priority over _KNOWN_OUTPUT_SCHEMAS."""
+    tool = _fake_tool("bash")
+    tool.output_schema = {"properties": {"special_key": {"type": "string"}}}
+    tools = {"bash": tool}
+    describe = _make_describe_fn(tools)
+    result = describe("bash")
+    assert "special_key" in result["keys"]
+    assert result["source"] == "output_schema"
+
+
+def test_describe_unknown_tool_not_in_known_schemas():
+    """Tool present in session but absent from _KNOWN_OUTPUT_SCHEMAS returns source=unknown."""
+    tool = MagicMock()
+    tool.name = "mystery_tool"
+    tool.input_schema = {"type": "object", "properties": {}, "required": []}
+    # No output_schema
+    del tool.output_schema
+    tools = {"mystery_tool": tool}
+    describe = _make_describe_fn(tools)
+    result = describe("mystery_tool")
+    assert result["source"] == "unknown"
+    assert "note" in result
+
+
+@pytest.mark.asyncio
+async def test_describe_is_pre_injected_in_exec_namespace():
+    """describe() must be available inside code blocks without any import."""
+    result = await _execute_code(
+        code=(
+            "import json\n"
+            "info = describe('bash')\n"
+            "print(json.dumps({'keys': info['keys'], 'source': info['source']}))"
+        ),
+        tools={},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    import json
+    parsed = json.loads(result)
+    assert parsed["keys"] == ["stdout", "stderr", "returncode"]
+    assert parsed["source"] == "known"
+
+
+@pytest.mark.asyncio
+async def test_describe_in_exec_returns_error_for_missing_tool():
+    """describe() inside exec must gracefully handle an unknown tool name."""
+    result = await _execute_code(
+        code=(
+            "info = describe('does_not_exist')\n"
+            "print('error' in info)\n"
+        ),
+        tools={},
+        hooks=_NoOpHooks(),
+        timeout=10,
+    )
+    assert result.strip() == "True"

@@ -27,6 +27,28 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Known return schemas — fallback when tools don't declare output_schema
+# ---------------------------------------------------------------------------
+# Keys must match the actual dict keys the tool returns at runtime.
+# This dict drives two features:
+#   1. Stub docstrings: _generate_tool_interfaces() emits "Returns: dict — keys: 'x', 'y'"
+#   2. describe() helper: pre-injected into exec() namespace so code can inspect at runtime.
+
+_KNOWN_OUTPUT_SCHEMAS: dict[str, list[str]] = {
+    "bash": ["stdout", "stderr", "returncode"],
+    "read_file": ["content", "file_path", "total_lines", "lines_read", "offset"],
+    "write_file": ["file_path", "bytes"],
+    "edit_file": ["file_path", "success"],
+    "web_fetch": ["url", "content", "content_type", "truncated", "total_bytes"],
+    "web_search": ["results"],
+    "glob": ["files", "total_files"],
+    "grep": ["matches", "total_matches"],
+    "delegate": ["response", "session_id", "status", "turn_count"],
+    "todo": ["count", "status", "todos"],
+}
+
+
+# ---------------------------------------------------------------------------
 # No-op hooks shim
 # ---------------------------------------------------------------------------
 
@@ -136,7 +158,7 @@ def _generate_tool_interfaces(tools: dict[str, Any]) -> str:
             if annotation_parts:
                 doc_lines.append(f"    {pname}: {' — '.join(annotation_parts)}")
 
-        # ---- return shape (from output_schema if present, else generic) ----
+        # ---- return shape (output_schema > _KNOWN_OUTPUT_SCHEMAS > generic) ----
         output_schema = getattr(tool, "output_schema", None)
         if output_schema and isinstance(output_schema, dict):
             out_props = output_schema.get("properties", {})
@@ -145,6 +167,9 @@ def _generate_tool_interfaces(tools: dict[str, Any]) -> str:
                 doc_lines.append(f"    Returns: dict — keys: {keys_str}")
             else:
                 doc_lines.append("    Returns: dict")
+        elif name in _KNOWN_OUTPUT_SCHEMAS:
+            keys_str = ", ".join(f"'{k}'" for k in _KNOWN_OUTPUT_SCHEMAS[name])
+            doc_lines.append(f"    Returns: dict — keys: {keys_str}")
         else:
             doc_lines.append("    Returns: dict — use result['key'] to access values")
 
@@ -277,6 +302,57 @@ async def _gather_limited(coros: Any, limit: int = 10) -> list[Any]:
     return list(await asyncio.gather(*[_one(c) for c in coros]))
 
 
+def _make_describe_fn(tools: dict[str, Any]) -> Any:
+    """Return a describe() function pre-loaded with the available tools.
+
+    The returned function is pre-injected into the exec() namespace as `describe`.
+    It lets code inspect a tool's return keys before using them — a runtime safety
+    net that mirrors what the stub docstrings already show at prompt time.
+
+    Usage inside a code block (no import needed):
+        print(describe("bash"))
+        # → {'keys': ['stdout', 'stderr', 'returncode'], 'source': 'known'}
+    """
+
+    def describe(tool_name: str) -> dict[str, Any]:
+        """Return the documented return shape for a tool.
+
+        Args:
+            tool_name: Name of the tool to describe (e.g. "bash", "read_file").
+
+        Returns:
+            dict with 'keys' (list[str]) and 'source' ('output_schema' | 'known' | 'unknown').
+            On unknown tool: {'error': str, 'available': list[str]}.
+        """
+        tool = tools.get(tool_name)
+
+        # Priority 1: authoritative output_schema on the mounted tool object
+        if tool is not None:
+            output_schema = getattr(tool, "output_schema", None)
+            if output_schema and isinstance(output_schema, dict):
+                props = output_schema.get("properties", {})
+                if props:
+                    return {"keys": list(props.keys()), "source": "output_schema"}
+
+        # Priority 2: module-level known schemas (works even if the tool is not mounted,
+        # so describe("bash") is useful as a reference even before the first call)
+        if tool_name in _KNOWN_OUTPUT_SCHEMAS:
+            return {"keys": _KNOWN_OUTPUT_SCHEMAS[tool_name], "source": "known"}
+
+        # Priority 3: tool is mounted but has no documented schema
+        if tool is not None:
+            return {
+                "keys": [],
+                "source": "unknown",
+                "note": "keys not documented — call the tool and print(list(result.keys()))",
+            }
+
+        # Priority 4: not mounted, not known
+        return {"error": f"unknown tool '{tool_name}'", "available": sorted(tools.keys())}
+
+    return describe
+
+
 async def _execute_code(
     code: str,
     tools: dict[str, Any],
@@ -293,6 +369,7 @@ async def _execute_code(
     namespace: dict[str, Any] = {
         "asyncio": asyncio,  # pre-injected: asyncio.gather(), asyncio.sleep(), etc.
         "gather_limited": _gather_limited,  # pre-injected: cap concurrency, e.g. await gather_limited([...], limit=10)
+        "describe": _make_describe_fn(tools),  # pre-injected: describe("bash") → {'keys': ['stdout', 'stderr', 'returncode']}
         **{name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()},
     }
 
@@ -393,7 +470,9 @@ class CodeModeTool:
             "Standard library (json, os, re, pathlib, etc.) is also available.\n"
             "asyncio is pre-injected — use asyncio.gather() directly without import.\n"
             "gather_limited(coros, limit=10) is also pre-injected — cap concurrent tool calls:\n"
-            "  results = await gather_limited([tool(x) for x in items], limit=20)"
+            "  results = await gather_limited([tool(x) for x in items], limit=20)\n"
+            "describe(tool_name) is also pre-injected — check a tool's return keys before using:\n"
+            "  print(describe('bash'))  # → {'keys': ['stdout', 'stderr', 'returncode'], 'source': 'known'}"
         )
 
     async def execute(self, input_data: dict[str, Any]) -> Any:

@@ -311,20 +311,27 @@ for path, diags in errors[:5]:
 
 ## Tool return shapes
 
-All tool functions return **dicts**, not strings. Common shapes:
+All tool functions return **dicts**, not strings. Return keys for common tools appear
+directly in each stub's docstring above (e.g. `Returns: dict — keys: 'stdout', 'stderr', 'returncode'`).
 
-| Tool | Key return fields |
-|---|---|
-| `bash` | `stdout`, `stderr`, `returncode` |
-| `read_file` | `content`, `file_path`, `total_lines`, `lines_read`, `offset` |
-| `write_file` | `file_path`, `bytes` |
-| `edit_file` | `file_path`, `success` |
-| `web_fetch` | `url`, `content`, `content_type`, `truncated`, `total_bytes` |
-| `glob` | `files`, `total_files` |
-| `grep` | `matches`, `total_matches` |
-| `LSP` | operation-specific (see LSP docs) |
+**At runtime**, use the pre-injected `describe(tool_name)` helper to get the return keys
+before accessing them — no import needed:
 
-If you're unsure of a tool's keys: `print(list(result.keys()))`.
+```python
+print(describe("bash"))
+# → {'keys': ['stdout', 'stderr', 'returncode'], 'source': 'known'}
+
+print(describe("read_file"))
+# → {'keys': ['content', 'file_path', 'total_lines', 'lines_read', 'offset'], 'source': 'known'}
+
+# Verify before accessing — prevents KeyError crashes:
+info = describe("some_tool")
+result = await some_tool(param="value")
+print(result[info["keys"][0]])  # safe: key confirmed at runtime
+```
+
+If `describe` returns `source: 'unknown'`, fall back to `print(list(result.keys()))` after
+the first call to discover the actual keys.
 
 ## Rules inside the code block
 
