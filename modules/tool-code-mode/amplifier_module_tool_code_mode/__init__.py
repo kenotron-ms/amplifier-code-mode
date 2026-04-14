@@ -41,8 +41,12 @@ _KNOWN_OUTPUT_SCHEMAS: dict[str, list[str]] = {
     "edit_file": ["file_path", "success"],
     "web_fetch": ["url", "content", "content_type", "truncated", "total_bytes"],
     "web_search": ["results"],
-    "glob": ["files", "total_files"],
-    "grep": ["matches", "total_matches"],
+    # glob: actual runtime keys — iterate result['matches'], not result directly.
+    # Iterating over the dict gives string keys, causing TypeError when subscripted.
+    "glob": ["matches", "count", "total_files"],
+    # grep: data key varies by output_mode: 'results' (content), 'files' (files_with_matches), 'counts' (count).
+    # 'matches' is NOT a valid key — iterating result directly gives string keys, causing TypeError.
+    "grep": ["results", "total_matches", "matches_count"],
     "delegate": ["response", "session_id", "status", "turn_count"],
     "todo": ["count", "status", "todos"],
 }

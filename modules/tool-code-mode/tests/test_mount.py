@@ -849,14 +849,17 @@ def test_stubs_show_known_return_keys_for_bash():
 
 
 def test_stubs_show_known_return_keys_for_glob():
-    """Stub for 'glob' must show its known keys."""
+    """Stub for 'glob' must show its actual runtime keys (matches, not files)."""
     tool = MagicMock()
     tool.name = "glob"
     tool.description = "Glob files."
     tool.input_schema = {"type": "object", "properties": {}, "required": []}
     result = _generate_tool_interfaces({"glob": tool})
-    assert "'files'" in result
+    # 'matches' is the actual key returned by glob() at runtime, not 'files'.
+    # Using 'files' was a bug that caused TypeError when agents iterated directly over result.
+    assert "'matches'" in result
     assert "'total_files'" in result
+    assert "'files'" not in result  # old wrong key must NOT appear
 
 
 def test_stubs_use_generic_fallback_for_unknown_tools():
