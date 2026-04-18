@@ -23,10 +23,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from amplifier_module_tool_code_mode import (
+    _KNOWN_OUTPUT_SCHEMAS,
     CodeModeTool,
     _execute_code,
     _generate_tool_interfaces,
-    _KNOWN_OUTPUT_SCHEMAS,
     _make_describe_fn,
     _NoOpHooks,
     _remove_unused_imports,
@@ -717,6 +717,70 @@ async def test_execute_fast_path_passes_tool_args():
         sys.modules.pop("amplifier_core", None)
 
 
+@pytest.mark.asyncio
+async def test_execute_fast_path_tool_args_as_json_string():
+    """Fast path must parse tool_args if the LLM passes it as a JSON string instead of a dict."""
+    import json
+
+    _install_fake_amplifier_core()
+    try:
+        fake_tool = MagicMock()
+        fake_tool.input_schema = {"type": "object", "properties": {}, "required": []}
+        result_mock = MagicMock()
+        result_mock.output = "written"
+        fake_tool.execute = AsyncMock(return_value=result_mock)
+
+        coord = _fake_coordinator(tools={"write_file": fake_tool})
+        tool = CodeModeTool(coordinator=coord, config={})
+        args = {"file_path": "/tmp/x.txt", "content": "hello"}
+        # LLM incorrectly serialises tool_args as a JSON string
+        result = await tool.execute({"tool_name": "write_file", "tool_args": json.dumps(args)})
+
+        # Should succeed and forward the parsed dict
+        assert result.success is True
+        fake_tool.execute.assert_called_once_with(args)
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_tool_args_invalid_json_string():
+    """Fast path must return a clear error when tool_args is an un-parseable JSON string."""
+    _install_fake_amplifier_core()
+    try:
+        fake_tool = MagicMock()
+        fake_tool.execute = AsyncMock()
+
+        coord = _fake_coordinator(tools={"bash": fake_tool})
+        tool = CodeModeTool(coordinator=coord, config={})
+        result = await tool.execute({"tool_name": "bash", "tool_args": "{not valid json"})
+
+        assert result.success is False
+        assert "tool_args" in result.output
+        fake_tool.execute.assert_not_called()
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
+@pytest.mark.asyncio
+async def test_execute_fast_path_tool_args_wrong_type():
+    """Fast path must return a clear error when tool_args is a non-dict, non-string type."""
+    _install_fake_amplifier_core()
+    try:
+        fake_tool = MagicMock()
+        fake_tool.execute = AsyncMock()
+
+        coord = _fake_coordinator(tools={"bash": fake_tool})
+        tool = CodeModeTool(coordinator=coord, config={})
+        result = await tool.execute({"tool_name": "bash", "tool_args": ["command", "ls"]})
+
+        assert result.success is False
+        assert "list" in result.output
+        fake_tool.execute.assert_not_called()
+    finally:
+        sys.modules.pop("amplifier_core", None)
+
+
 # ---------------------------------------------------------------------------
 # _remove_unused_imports — deterministic lint + auto-fix (no LLM)
 # ---------------------------------------------------------------------------
@@ -944,6 +1008,7 @@ async def test_describe_is_pre_injected_in_exec_namespace():
         timeout=10,
     )
     import json
+
     parsed = json.loads(result)
     assert parsed["keys"] == ["stdout", "stderr", "returncode"]
     assert parsed["source"] == "known"
@@ -953,10 +1018,7 @@ async def test_describe_is_pre_injected_in_exec_namespace():
 async def test_describe_in_exec_returns_error_for_missing_tool():
     """describe() inside exec must gracefully handle an unknown tool name."""
     result = await _execute_code(
-        code=(
-            "info = describe('does_not_exist')\n"
-            "print('error' in info)\n"
-        ),
+        code=("info = describe('does_not_exist')\nprint('error' in info)\n"),
         tools={},
         hooks=_NoOpHooks(),
         timeout=10,

@@ -14,11 +14,12 @@ Reference: https://blog.cloudflare.com/code-mode/
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import io
+import json
 import logging
-import ast
 import textwrap
 import uuid
 from typing import Any
@@ -245,49 +246,50 @@ def _make_wrapper(tool_name: str, tool_obj: Any, hooks: Any) -> Any:
 # Ruff lint + auto-fix (deterministic, no LLM)
 # ---------------------------------------------------------------------------
 
+
 def _remove_unused_imports(code: str) -> str:
-        """Remove unused imports from code using Python's ast module.
+    """Remove unused imports from code using Python's ast module.
 
-        Walks the AST to find every Name/Attribute root referenced outside import
-        statements, then drops any import whose bound names are entirely absent.
-        Returns the original code unchanged if parsing fails (SyntaxError is left
-        for compile() to surface with a cleaner message).
-        Completely in-process — no subprocess, no temp files, no external tools.
-        """
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return code
+    Walks the AST to find every Name/Attribute root referenced outside import
+    statements, then drops any import whose bound names are entirely absent.
+    Returns the original code unchanged if parsing fails (SyntaxError is left
+    for compile() to surface with a cleaner message).
+    Completely in-process — no subprocess, no temp files, no external tools.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
 
-        # Collect every name referenced in non-import nodes.
-        used: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            if isinstance(node, ast.Name):
-                used.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                root = node
-                while isinstance(root, ast.Attribute):
-                    root = root.value  # type: ignore[assignment]
-                if isinstance(root, ast.Name):
-                    used.add(root.id)
+    # Collect every name referenced in non-import nodes.
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            root = node
+            while isinstance(root, ast.Attribute):
+                root = root.value  # type: ignore[assignment]
+            if isinstance(root, ast.Name):
+                used.add(root.id)
 
-        # Find line ranges of import statements whose bound names are all unused.
-        drop: set[int] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                if all((a.asname or a.name.split(".")[0]) not in used for a in node.names):
-                    drop.update(range(node.lineno, node.end_lineno + 1))
-            elif isinstance(node, ast.ImportFrom):
-                if all((a.asname or a.name) not in used for a in node.names):
-                    drop.update(range(node.lineno, node.end_lineno + 1))
+    # Find line ranges of import statements whose bound names are all unused.
+    drop: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if all((a.asname or a.name.split(".")[0]) not in used for a in node.names):
+                drop.update(range(node.lineno, node.end_lineno + 1))
+        elif isinstance(node, ast.ImportFrom):
+            if all((a.asname or a.name) not in used for a in node.names):
+                drop.update(range(node.lineno, node.end_lineno + 1))
 
-        if not drop:
-            return code
+    if not drop:
+        return code
 
-        kept = [ln for i, ln in enumerate(code.splitlines(keepends=True), 1) if i not in drop]
-        return "".join(kept).strip()
+    kept = [ln for i, ln in enumerate(code.splitlines(keepends=True), 1) if i not in drop]
+    return "".join(kept).strip()
 
 
 async def _gather_limited(coros: Any, limit: int = 10) -> list[Any]:
@@ -373,7 +375,9 @@ async def _execute_code(
     namespace: dict[str, Any] = {
         "asyncio": asyncio,  # pre-injected: asyncio.gather(), asyncio.sleep(), etc.
         "gather_limited": _gather_limited,  # pre-injected: cap concurrency, e.g. await gather_limited([...], limit=10)
-        "describe": _make_describe_fn(tools),  # pre-injected: describe("bash") → {'keys': ['stdout', 'stderr', 'returncode']}
+        "describe": _make_describe_fn(
+            tools
+        ),  # pre-injected: describe("bash") → {'keys': ['stdout', 'stderr', 'returncode']}
         **{name: _make_wrapper(name, tool, hooks) for name, tool in tools.items()},
     }
 
@@ -498,13 +502,32 @@ class CodeModeTool:
             tool = run_tools.get(tool_name)
             if tool is None:
                 return ToolResult(success=False, output=f"Error: unknown tool '{tool_name}'")
-            tool_args: dict[str, Any] = input_data.get("tool_args") or {}
+            _raw_args = input_data.get("tool_args") or {}
+            if isinstance(_raw_args, str):
+                try:
+                    _raw_args = json.loads(_raw_args)
+                except json.JSONDecodeError as _exc:
+                    return ToolResult(
+                        success=False,
+                        output=f"Error: tool_args must be a JSON object, got invalid JSON string: {_exc}",
+                    )
+            if not isinstance(_raw_args, dict):
+                return ToolResult(
+                    success=False,
+                    output=f"Error: tool_args must be a dict/object, got {type(_raw_args).__name__}",
+                )
+            tool_args: dict[str, Any] = _raw_args
             call_id = str(uuid.uuid4())
             await hooks.emit(
                 "code_mode:tool:pre",
                 {"call_id": call_id, "tool_name": tool_name, "tool_input": tool_args},
             )
-            result = await tool.execute(tool_args)
+            try:
+                result = await tool.execute(tool_args)
+            except Exception as exc:  # noqa: BLE001
+                return ToolResult(
+                    success=False, output=f"Error executing tool '{tool_name}': {exc}"
+                )
             output = getattr(result, "output", None)
             if output is None:
                 output = str(result)
