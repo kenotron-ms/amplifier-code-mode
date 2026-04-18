@@ -22,6 +22,7 @@ import json
 import logging
 import textwrap
 import uuid
+import warnings
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,9 @@ def _remove_unused_imports(code: str) -> str:
     Completely in-process — no subprocess, no temp files, no external tools.
     """
     try:
-        tree = ast.parse(code)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(code)
     except SyntaxError:
         return code
 
@@ -393,7 +396,9 @@ async def _execute_code(
 
     buf = io.StringIO()
     try:
-        exec(compile(wrapped, "<tool_code_mode>", "exec"), namespace)  # noqa: S102
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            exec(compile(wrapped, "<tool_code_mode>", "exec"), namespace)  # noqa: S102
         with contextlib.redirect_stdout(buf):
             await asyncio.wait_for(
                 namespace["_tool_code_mode_main"](),
