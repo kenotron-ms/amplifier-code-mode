@@ -7,10 +7,7 @@ bundle:
     to orchestrate multi-tool workflows instead of making individual tool calls.
     No orchestrator swap required. Based on https://blog.cloudflare.com/code-mode/
 
-includes:
-  - bundle: git+https://github.com/microsoft/amplifier-foundation@main
-
-# Add tool_code_mode on top of foundation's defaults.
+# Add tool_code_mode on top of whatever bundle the user already has.
 # No orchestrator change — works with loop-basic, loop-streaming, or any orchestrator.
 tools:
   - module: tool-code-mode
